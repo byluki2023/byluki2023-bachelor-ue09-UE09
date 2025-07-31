@@ -1,0 +1,323 @@
+name: Autograding Tests
+
+on:
+  push:
+    branches:
+      - main
+  repository_dispatch:
+
+permissions:
+  checks: write
+  actions: read
+  contents: write  # Wichtig für points-bar!
+
+jobs:
+  run-autograding-tests:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-classroom[bot]'
+    outputs:
+      a01test-result: ${{ steps.a01test.outputs.result }}
+      a02test-result: ${{ steps.a02test.outputs.result }}
+      a03test-result: ${{ steps.a03test.outputs.result }}
+      a04test-result: ${{ steps.a04test.outputs.result }}
+      a05test-result: ${{ steps.a05test.outputs.result }}
+      advancedcodequalitytest-result: ${{ steps.advancedcodequalitytest.outputs.result }}
+
+    steps:
+      # --- STUDENTEN-REPO ---
+      - name: Checkout Student Repo Code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      # --- BUILD STUDENT CODE ---
+      - name: Build Student Project
+        run: mvn clean install --batch-mode
+
+      # --- CREATE SonarCloud ---
+      - name: Create SonarCloud Project if not exists
+        run: |
+          PROJECT_KEY="byluki2023_UE09-${{ github.event.repository.name }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          ORG="byluki2023"
+
+          EXISTS=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+            "https://sonarcloud.io/api/components/show?component=$PROJECT_KEY" \
+            | jq -r '.component.key // empty')
+
+          if [ -z "$EXISTS" ]; then
+            curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+              -X POST "https://sonarcloud.io/api/projects/create" \
+              -d "name=$REPO_NAME" \
+              -d "project=$PROJECT_KEY" \
+              -d "organization=$ORG"
+          fi
+
+      # --- SONARQUBE ANALYSE ---
+      - name: SonarQube Analysis
+        id: sonarqubecheck
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: SonarQubeCheck
+          setup-command: |
+            sudo apt-get update && sudo apt-get install -y jq
+          command: |
+            PROJECT_KEY="byluki2023_UE09-${{ github.event.repository.name }}"
+            mvn sonar:sonar \
+              -Dsonar.projectKey=$PROJECT_KEY \
+              -Dsonar.projectName=${{ github.event.repository.name }} \
+              -Dsonar.organization=byluki2023 \
+              -Dsonar.host.url=https://sonarcloud.io \
+              -Dsonar.token=${{ secrets.SONAR_TOKEN }} \
+              --batch-mode
+          timeout: 10
+          max-score: 0
+
+      # --- ADVANCED SONARQUBE QUALITY CHECK ---
+      - name: Advanced Code Quality Test
+        id: advancedcodequalitytest
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Advanced Code Quality Test
+          setup-command: |
+            sudo apt-get update && sudo apt-get install -y jq bc
+          command: |
+            PROJECT_KEY="byluki2023_UE09-${{ github.event.repository.name }}"
+
+            CODE_SMELLS=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+              "https://sonarcloud.io/api/measures/component?component=$PROJECT_KEY&metricKeys=code_smells" \
+              | jq -r '.component.measures[0].value // "0"')
+
+            BUGS=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+              "https://sonarcloud.io/api/measures/component?component=$PROJECT_KEY&metricKeys=bugs" \
+              | jq -r '.component.measures[0].value // "0"')
+
+            VULNERABILITIES=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+              "https://sonarcloud.io/api/measures/component?component=$PROJECT_KEY&metricKeys=vulnerabilities" \
+              | jq -r '.component.measures[0].value // "0"')
+
+            SCORE=0
+            if [ "$CODE_SMELLS" -le 1 ]; then SCORE=$((SCORE + 1)); fi
+            if [ "$BUGS" -eq 0 ]; then SCORE=$((SCORE + 1)); fi
+            if [ "$VULNERABILITIES" -eq 0 ]; then SCORE=$((SCORE + 1)); fi
+
+            echo "Quality Score: $SCORE/3"
+            exit 0
+          timeout: 10
+          max-score: 3
+
+      # --- SONARQUBE PROJECT DELETION ---
+      - name: Delete SonarCloud Project
+        if: always()
+        run: |
+          PROJECT_KEY="byluki2023_UE09-${{ github.event.repository.name }}"
+
+          # Check if project exists
+          EXISTS=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+            "https://sonarcloud.io/api/components/show?component=$PROJECT_KEY" \
+            | jq -r '.component.key // empty')
+
+          if [ -n "$EXISTS" ]; then
+            echo "Deleting SonarCloud project $PROJECT_KEY..."
+            curl -s -X POST \
+              -u "${{ secrets.SONAR_TOKEN }}:" \
+              "https://sonarcloud.io/api/projects/delete?project=$PROJECT_KEY"
+            echo "SonarCloud project deleted."
+          else
+            echo "No SonarCloud project $PROJECT_KEY found. Skipping deletion."
+          fi
+
+      # --- TESTS-REPO ---
+      - name: Checkout Tests Repo
+        uses: actions/checkout@v4
+        with:
+          repository: byluki2023/UE09_AllTests
+          path: tests
+
+      # --- COPY TESTS INTO STUDENTEN-REPO ---
+      - name: Copy Tests into student repo
+        run: |
+          mkdir -p src/test/java/se/jku/at/exercise
+          cp tests/src/test/java/se/jku/at/exercise/*.java src/test/java/se/jku/at/exercise/
+
+      # --- TEST CASES ---
+      - name: A01_Tests
+        id: a01test
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: A01_Tests
+          command: mvn test -Dtest=A01_Tests --batch-mode
+          timeout: 5
+          max-score: 4
+
+      - name: A02_Tests
+        id: a02test
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: A02_Tests
+          command: mvn test -Dtest=A02_Tests --batch-mode
+          timeout: 5
+          max-score: 5
+
+      - name: A03_Tests
+        id: a03test
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: A03_Tests
+          command: mvn test -Dtest=A03_Tests --batch-mode
+          timeout: 5
+          max-score: 5
+
+      - name: A04_Tests
+        id: a04test
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: A04_Tests
+          command: mvn test -Dtest=A04_Tests --batch-mode
+          timeout: 5
+          max-score: 5
+
+      - name: A05_Tests
+        id: a05test
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: A05_Tests
+          command: mvn test -Dtest=A05_Tests --batch-mode
+          timeout: 5
+          max-score: 5
+
+      # --- BEDINGTE PUNKTEBERECHNUNG FÜR REPORTER ---
+      - name: Calculate Test Score for Reporter
+        id: calculate-test-score
+        run: |
+          # Decode test results and calculate test score
+          A01_SCORE=$(printf '%s' '${{ steps.a01test.outputs.result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A02_SCORE=$(printf '%s' '${{ steps.a02test.outputs.result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A03_SCORE=$(printf '%s' '${{ steps.a03test.outputs.result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A04_SCORE=$(printf '%s' '${{ steps.a04test.outputs.result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A05_SCORE=$(printf '%s' '${{ steps.a05test.outputs.result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          
+          TEST_SCORE=$((A01_SCORE + A02_SCORE + A03_SCORE + A04_SCORE + A05_SCORE))
+          
+          echo "Test Score: $TEST_SCORE"
+          echo "test_score=$TEST_SCORE" >> $GITHUB_OUTPUT
+          
+          # Set quality results based on test score
+          if [ $TEST_SCORE -ge 12 ]; then
+            echo "quality_results=${{ steps.advancedcodequalitytest.outputs.result }}" >> $GITHUB_OUTPUT
+            echo "include_quality=true" >> $GITHUB_OUTPUT
+            echo "✅ Including quality results in reporter"
+          else
+            # Create a dummy result with 0 score for quality test
+            DUMMY_RESULT=$(echo '{"version": 1, "tests": [{"name": "Advanced Code Quality Test", "score": 0, "max_score": 3, "status": "pass", "message": "Quality bonus not applied - insufficient test score"}]}' | base64 -w 0)
+            echo "quality_results=$DUMMY_RESULT" >> $GITHUB_OUTPUT
+            echo "include_quality=false" >> $GITHUB_OUTPUT
+            echo "❌ Quality bonus not applied - using dummy result"
+          fi
+
+      # --- AUTOGRADING REPORTER ---
+      - name: Autograding Reporter
+        uses: classroom-resources/autograding-grading-reporter@v1
+        env:
+          SONARQUBECHECK_RESULTS: "${{steps.sonarqubecheck.outputs.result}}"
+          ADVANCEDCODEQUALITYTEST_RESULTS: "${{steps.calculate-test-score.outputs.quality_results}}"
+          A01TEST_RESULTS: "${{steps.a01test.outputs.result}}"
+          A02TEST_RESULTS: "${{steps.a02test.outputs.result}}"
+          A03TEST_RESULTS: "${{steps.a03test.outputs.result}}"
+          A04TEST_RESULTS: "${{steps.a04test.outputs.result}}"
+          A05TEST_RESULTS: "${{steps.a05test.outputs.result}}"
+        with:
+          runners: sonarqubecheck,advancedcodequalitytest,a01test,a02test,a03test,a04test,a05test
+
+  update-points-bar:
+    needs: run-autograding-tests
+    runs-on: ubuntu-latest
+    if: always() && needs.run-autograding-tests.result != 'cancelled'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: git checkout status || git checkout -b status
+
+      - name: Calculate Points
+        id: calculate-points
+        run: |
+          A01_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.a01test-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A02_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.a02test-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A03_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.a03test-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A04_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.a04test-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A05_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.a05test-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          QUALITY_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.advancedcodequalitytest-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+
+          TEST_SCORE=$((A01_SCORE + A02_SCORE + A03_SCORE + A04_SCORE + A05_SCORE))
+
+          if [ $TEST_SCORE -ge 12 ]; then
+            TOTAL_SCORE=$((TEST_SCORE + QUALITY_SCORE))
+            echo "✅ Test score >= 12, adding quality bonus"
+          else
+            TOTAL_SCORE=$TEST_SCORE
+            QUALITY_SCORE=0
+            echo "❌ Test score < 12, quality bonus not applied"
+          fi
+
+          MAX_SCORE=27
+
+          echo "Final calculated score: $TOTAL_SCORE/$MAX_SCORE"
+          echo "points=$TOTAL_SCORE/$MAX_SCORE" >> $GITHUB_OUTPUT
+
+          # Export values for reuse in later steps
+          echo "A01_SCORE=$A01_SCORE" >> $GITHUB_ENV
+          echo "A02_SCORE=$A02_SCORE" >> $GITHUB_ENV
+          echo "A03_SCORE=$A03_SCORE" >> $GITHUB_ENV
+          echo "A04_SCORE=$A04_SCORE" >> $GITHUB_ENV
+          echo "A05_SCORE=$A05_SCORE" >> $GITHUB_ENV
+          echo "QUALITY_SCORE=$QUALITY_SCORE" >> $GITHUB_ENV
+          echo "TOTAL_SCORE=$TOTAL_SCORE" >> $GITHUB_ENV
+          echo "MAX_SCORE=$MAX_SCORE" >> $GITHUB_ENV
+
+      - name: Generate Points Bar
+        uses: markpatterson27/points-bar@v1
+        with:
+          points: ${{ steps.calculate-points.outputs.points }}
+          path: '.github/icons/points-bar.svg'
+
+      - name: Generate Points Table Markdown
+        run: |
+          mkdir -p .github/icons
+          {
+            echo "| Test | Score | Max Score |"
+            echo "|------|-------|-----------|"
+            echo "| A01_Tests | $A01_SCORE | 4 |"
+            echo "| A02_Tests | $A02_SCORE | 5 |"
+            echo "| A03_Tests | $A03_SCORE | 5 |"
+            echo "| A04_Tests | $A04_SCORE | 5 |"
+            echo "| A05_Tests | $A05_SCORE | 5 |"
+            echo "| Advanced Code Quality Test | $QUALITY_SCORE | 3 |"
+            echo ""
+            echo "**Gesamt:** $TOTAL_SCORE / $MAX_SCORE"
+          } > .github/icons/points-table.md
+
+      - name: Commit changes to points bar and table
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add '.github/icons/points-bar.svg'
+          git add '.github/icons/points-table.md'
+          git commit -m "Add/Update points bar and table" || exit 0
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git push origin status
