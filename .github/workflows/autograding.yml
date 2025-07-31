@@ -1,0 +1,298 @@
+name: Autograding Tests
+
+on:
+  push:
+    branches:
+      - main
+  repository_dispatch:
+
+permissions:
+  checks: write
+  actions: read
+  contents: read
+
+jobs:
+  run-autograding-tests:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-classroom[bot]'
+
+    steps:
+      # --- STUDENTEN-REPO ---
+      - name: Checkout Student Repo Code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      # --- BUILD STUDENT CODE ---
+      - name: Build Student Project
+        run: mvn clean install --batch-mode
+
+      # --- SONARQUBE PROJECT CREATION ---
+      - name: Create SonarCloud Project if not exists
+        run: |
+          PROJECT_KEY="byluki2023_UE09-${{ github.event.repository.name }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          ORG="byluki2023"
+
+          EXISTS=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+            "https://sonarcloud.io/api/components/show?component=$PROJECT_KEY" \
+            | jq -r '.component.key // empty')
+
+          if [ -z "$EXISTS" ]; then
+            echo "Creating SonarCloud project $PROJECT_KEY..."
+            curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+              -X POST "https://sonarcloud.io/api/projects/create" \
+              -d "name=$REPO_NAME" \
+              -d "project=$PROJECT_KEY" \
+              -d "organization=$ORG"
+            echo "SonarCloud project created."
+          else
+            echo "SonarCloud project $PROJECT_KEY already exists."
+          fi
+
+      # --- SONARQUBE ANALYSE ---
+      - name: SonarQube Analysis
+        id: sonarqubecheck
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: SonarQubeCheck
+          setup-command: |
+            sudo apt-get update && sudo apt-get install -y jq
+          command: |
+            PROJECT_KEY="byluki2023_UE09-${{ github.event.repository.name }}"
+
+            mvn sonar:sonar \
+              -Dsonar.projectKey=$PROJECT_KEY \
+              -Dsonar.projectName=${{ github.event.repository.name }} \
+              -Dsonar.organization=byluki2023 \
+              -Dsonar.host.url=https://sonarcloud.io \
+              -Dsonar.token=${{ secrets.SONAR_TOKEN }} \
+              --batch-mode
+          timeout: 10
+          max-score: 0
+
+      # --- ADVANCED SONARQUBE QUALITY CHECK ---
+      - name: Advanced Code Quality Test
+        id: advancedcodequalitytest
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: Advanced Code Quality Test
+          setup-command: |
+            sudo apt-get update && sudo apt-get install -y jq bc
+          command: |
+            PROJECT_KEY="byluki2023_UE09-${{ github.event.repository.name }}"
+
+            CHECK=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+              "https://sonarcloud.io/api/components/show?component=$PROJECT_KEY" \
+              | jq -r '.component.key // empty')
+
+            if [ -z "$CHECK" ]; then
+              echo "❌ SonarQube project $PROJECT_KEY not found. Aborting quality checks."
+              exit 1
+            fi
+
+            CODE_SMELLS=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+              "https://sonarcloud.io/api/measures/component?component=$PROJECT_KEY&metricKeys=code_smells" \
+              | jq -r '.component.measures[0].value // "0"')
+
+            BUGS=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+              "https://sonarcloud.io/api/measures/component?component=$PROJECT_KEY&metricKeys=bugs" \
+              | jq -r '.component.measures[0].value // "0"')
+
+            VULNERABILITIES=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+              "https://sonarcloud.io/api/measures/component?component=$PROJECT_KEY&metricKeys=vulnerabilities" \
+              | jq -r '.component.measures[0].value // "0"')
+
+            CODE_SMELLS=${CODE_SMELLS:-0}
+            BUGS=${BUGS:-0}
+            VULNERABILITIES=${VULNERABILITIES:-0}
+
+            echo "Code Smells: $CODE_SMELLS"
+            echo "Bugs: $BUGS"
+            echo "Vulnerabilities: $VULNERABILITIES"
+
+            SCORE=0
+
+            if [ "$CODE_SMELLS" -le 1 ]; then SCORE=$((SCORE + 1)); fi
+            if [ "$BUGS" -eq 0 ]; then SCORE=$((SCORE + 1)); fi
+            if [ "$VULNERABILITIES" -eq 0 ]; then SCORE=$((SCORE + 1)); fi
+
+            echo "Quality Score: $SCORE/3"
+
+            if [ $SCORE -ge 2 ]; then
+              echo "✅ Code quality is acceptable!"
+              exit 0
+            else
+              echo "❌ Code quality needs improvement"
+              exit 1
+            fi
+          timeout: 10
+          max-score: 3
+
+      # --- SONARQUBE PROJECT DELETION ---
+      - name: Delete SonarCloud Project
+        if: always()
+        run: |
+          PROJECT_KEY="byluki2023_UE09-${{ github.event.repository.name }}"
+
+          EXISTS=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+            "https://sonarcloud.io/api/components/show?component=$PROJECT_KEY" \
+            | jq -r '.component.key // empty')
+
+          if [ -n "$EXISTS" ]; then
+            echo "Deleting SonarCloud project $PROJECT_KEY..."
+            curl -s -X POST \
+              -u "${{ secrets.SONAR_TOKEN }}:" \
+              "https://sonarcloud.io/api/projects/delete?project=$PROJECT_KEY"
+            echo "SonarCloud project deleted."
+          else
+            echo "No SonarCloud project $PROJECT_KEY found. Skipping deletion."
+          fi
+
+      # --- TESTS-REPO ---
+      - name: Checkout Tests Repo
+        uses: actions/checkout@v4
+        with:
+          repository: byluki2023/UE09_AllTests
+          path: tests
+
+      # --- COPY TESTS INTO STUDENTEN-REPO ---
+      - name: Copy Tests into student repo
+        run: |
+          mkdir -p src/test/java/se/jku/at/exercise
+          cp tests/src/test/java/se/jku/at/exercise/*.java src/test/java/se/jku/at/exercise/
+
+      # --- TEST CASES ---
+      - name: A01_Tests
+        id: a01test
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: A01_Tests
+          setup-command: ""
+          command: mvn test -Dtest=A01_Tests --batch-mode
+          timeout: 5
+          max-score: 4
+
+      - name: A02_Tests
+        id: a02test
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: A02_Tests
+          setup-command: ""
+          command: mvn test -Dtest=A02_Tests --batch-mode
+          timeout: 5
+          max-score: 5
+
+      - name: A03_Tests
+        id: a03test
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: A03_Tests
+          setup-command: ""
+          command: mvn test -Dtest=A03_Tests --batch-mode
+          timeout: 5
+          max-score: 5
+
+      - name: A04_Tests
+        id: a04test
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: A04_Tests
+          setup-command: ""
+          command: mvn test -Dtest=A04_Tests --batch-mode
+          timeout: 5
+          max-score: 5
+
+      - name: A05_Tests
+        id: a05test
+        uses: classroom-resources/autograding-command-grader@v1
+        with:
+          test-name: A05_Tests
+          setup-command: ""
+          command: mvn test -Dtest=A05_Tests --batch-mode
+          timeout: 5
+          max-score: 5
+
+      # --- AUTOGRADING REPORTER ---
+      - name: Autograding Reporter
+        uses: classroom-resources/autograding-grading-reporter@v1
+        env:
+          SONARQUBECHECK_RESULTS: "${{steps.sonarqubecheck.outputs.result}}"
+          ADVANCEDCODEQUALITYTEST_RESULTS: "${{steps.advancedcodequalitytest.outputs.result}}"
+          A01TEST_RESULTS: "${{steps.a01test.outputs.result}}"
+          A02TEST_RESULTS: "${{steps.a02test.outputs.result}}"
+          A03TEST_RESULTS: "${{steps.a03test.outputs.result}}"
+          A04TEST_RESULTS: "${{steps.a04test.outputs.result}}"
+          A05TEST_RESULTS: "${{steps.a05test.outputs.result}}"
+        with:
+          runners: sonarqubecheck,advancedcodequalitytest,a01test,a02test,a03test,a04test,a05test
+
+  update-points-bar:
+    needs: run-autograding-tests
+    runs-on: ubuntu-latest
+    if: always() && needs.run-autograding-tests.result != 'cancelled'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # switch to status branch (to match README link)
+      - run: git checkout status || git checkout -b status
+
+      # calculate dynamic points
+      - name: Calculate Points
+        id: calculate-points
+        run: |
+          # Extract and decode scores from test results (they are base64 encoded)
+          # The score is located in .tests[0].score, not directly in .score
+          A01_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.a01test-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A02_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.a02test-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A03_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.a03test-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A04_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.a04test-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          A05_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.a05test-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+          QUALITY_SCORE=$(printf '%s' '${{ needs.run-autograding-tests.outputs.advancedcodequalitytest-result }}' | base64 -d | jq -r '.tests[0].score // 0')
+
+          # Debug output - show raw and decoded values
+          echo "Raw A01 result: ${{ needs.run-autograding-tests.outputs.a01test-result }}"
+          echo "Decoded A01: $(printf '%s' '${{ needs.run-autograding-tests.outputs.a01test-result }}' | base64 -d)"
+          echo "A01: $A01_SCORE, A02: $A02_SCORE, A03: $A03_SCORE"
+          echo "A04: $A04_SCORE, A05: $A05_SCORE"
+          echo "Quality: $QUALITY_SCORE"
+
+          # Calculate total
+          TOTAL_SCORE=$((A01_SCORE + A02_SCORE + A03_SCORE + A04_SCORE + A05_SCORE + QUALITY_SCORE))
+          MAX_SCORE=27
+
+          echo "Calculated score: $TOTAL_SCORE/$MAX_SCORE"
+          echo "points=$TOTAL_SCORE/$MAX_SCORE" >> $GITHUB_OUTPUT
+
+      # create points bar with dynamic points
+      - name: Generate Points Bar
+        uses: markpatterson27/points-bar@v1
+        with:
+          points: ${{ steps.calculate-points.outputs.points }}
+          path: '.github/icons/points-bar.svg'
+
+      # commit and push badges if badges have changed
+      - name: Commit changes to points bar
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add '.github/icons/points-bar.svg'
+          git commit -m "Add/Update points bar" || exit 0
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git push origin status
